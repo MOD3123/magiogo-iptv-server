@@ -2,6 +2,7 @@ import atexit
 import datetime
 import gzip
 import os
+import re
 import sys
 from pathlib import Path
 from urllib.parse import urljoin, quote, urlparse
