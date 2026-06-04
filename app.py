@@ -25,6 +25,13 @@ PROXY_HEADERS = {
     'User-Agent': UA,
     'Origin': 'https://www.magiogo.sk',
     'Referer': 'https://www.magiogo.sk/',
+    'Accept': '*/*',
+    'Accept-Language': 'sk-SK,sk;q=0.9',
+    'Accept-Encoding': 'identity',
+    'Connection': 'keep-alive',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'cross-site',
 }
 
 
@@ -89,10 +96,25 @@ def rewrite_m3u8(content, base_url):
 
 
 def proxy_stream(url):
+    # Debug log
+    print(f"PROXY: {url}", flush=True)
     try:
-        upstream = requests.get(url, headers=PROXY_HEADERS, stream=True, timeout=30)
+        upstream = requests.get(
+            url,
+            headers=PROXY_HEADERS,
+            stream=True,
+            timeout=30,
+            allow_redirects=True,
+            verify=True,
+        )
+    except requests.exceptions.ConnectionError as e:
+        print(f"PROXY ConnectionError: {e} | URL: {url}", flush=True)
+        return Response(f'Connection error: {e}', status=502)
     except Exception as e:
+        print(f"PROXY Error: {e} | URL: {url}", flush=True)
         return Response(f'Proxy error: {e}', status=502)
+
+    print(f"PROXY status={upstream.status_code} ct={upstream.headers.get('Content-Type')} | {url[:100]}", flush=True)
 
     if upstream.status_code != 200:
         return Response(f'Upstream {upstream.status_code}: {url}', status=upstream.status_code)
