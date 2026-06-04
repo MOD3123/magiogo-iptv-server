@@ -4,4 +4,4 @@ requests==2.32.5
 roman==5.2
 tqdm==4.67.3
 urllib3==2.6.3
-xmltv
+git+https://github.com/knowit/xmltv.git#egg=xmltv
