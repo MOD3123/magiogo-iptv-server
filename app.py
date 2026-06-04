@@ -36,36 +36,45 @@ def make_proxy_url(abs_url):
 
 
 def rewrite_mpd(content, base_url):
-    """Prepíše všetky relatívne aj absolútne cesty v MPD manifeste cez /proxy."""
-    import re
-
-    # Base dir = URL bez posledného segmentu a bez query
+    """
+    Vloží <BaseURL> element do MPD aby všetky relatívne segmenty
+    šli cez náš /proxy endpoint. NEmení media= a initialization= atribúty
+    s template premennými ($Bandwidth$, $Time$, ...) – tie VLC expanduje sám.
+    """
+    # Vypočítaj base dir CDN (cesta po posledné /)
     parsed = urlparse(base_url)
-    path_parts = parsed.path.rsplit('/', 1)
-    base_dir = parsed.scheme + "://" + parsed.netloc + path_parts[0] + "/"
+    path = parsed.path
+    # Magio MPD cesta končí na /Manifest alebo /index.mpd/Manifest
+    if '/Manifest' in path:
+        base_path = path[:path.index('/Manifest') + 1]
+    elif path.endswith('/'):
+        base_path = path
+    else:
+        base_path = path.rsplit('/', 1)[0] + '/'
 
-    def to_proxy(url):
-        if url.startswith('http'):
-            abs_url = url
-        else:
-            abs_url = urljoin(base_dir, url)
-        return make_proxy_url(abs_url)
+    cdn_base = parsed.scheme + "://" + parsed.netloc + base_path
+    proxy_base = make_proxy_url(cdn_base)
 
-    # Prepíš atribúty: media="...", initialization="...", src="...", href="..."
-    def replace_attr(m):
-        attr = m.group(1)
-        val = m.group(2)
-        # Preskočme hodnoty s $Bandwidth$ a podobnými template premennými - tie sú template strings
-        # Len ak obsahuje skutočnú cestu (S! prefix alebo http)
-        if val.startswith('S!') or val.startswith('http') or '/' in val:
-            return f'{attr}="{to_proxy(val)}"'
-        return m.group(0)
+    # Vlož <BaseURL> hneď za <Period> tag (alebo na začiatok ak nie je)
+    base_url_element = f'<BaseURL>{proxy_base}</BaseURL>'
 
-    content = re.sub(
-        r'(media|initialization|src|href)="([^"]+)"',
-        replace_attr,
-        content
-    )
+    # Vlož za prvý <Period> tag
+    if '<Period' in content:
+        content = re.sub(
+            r'(<Period[^>]*>)',
+            r'\1' + base_url_element,
+            content,
+            count=1
+        )
+    elif '<MPD' in content:
+        # Fallback – vlož za MPD otvárajúci tag
+        content = re.sub(
+            r'(<MPD[^>]*>)',
+            r'\1' + base_url_element,
+            content,
+            count=1
+        )
+
     return content
 
 
