@@ -5,7 +5,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urljoin, quote, urlparse
+from urllib.parse import urljoin, quote, urlparse, unquote
 
 import requests
 import xmltv
@@ -32,20 +32,28 @@ def server_url():
     return os.environ.get('MAGIO_SERVER_PUBLIC_URL', 'http://127.0.0.1:5000')
 
 
-def make_proxy_url(abs_url):
-    return f"{server_url()}/proxy?url={quote(abs_url, safe='')}"
-
-
-def rewrite_mpd(content, base_url):
-    """
-    Vloží <BaseURL> element do MPD aby všetky relatívne segmenty
-    šli cez náš /proxy endpoint. NEmení media= a initialization= atribúty
-    s template premennými ($Bandwidth$, $Time$, ...) – tie VLC expanduje sám.
-    """
-    # Vypočítaj base dir CDN (cesta po posledné /)
-    parsed = urlparse(base_url)
+def cdn_base_dir(url):
+    """Vráti base dir CDN URL (cesta po posledné /)."""
+    parsed = urlparse(url)
     path = parsed.path
-    # Magio MPD cesta končí na /Manifest alebo /index.mpd/Manifest
+    if '/Manifest' in path:
+        base_path = path[:path.index('/Manifest') + 1]
+    elif path.endswith('/'):
+        base_path = path
+    else:
+        base_path = path.rsplit('/', 1)[0] + '/'
+    return parsed.scheme + "://" + parsed.netloc + base_path
+
+
+def make_base_url(cdn_url):
+    """
+    Vytvorí BaseURL pre MPD tak aby VLC mohol priamo pripojiť relatívnu cestu.
+    Format: https://render.com/cdn/PATH?h=HOST
+    VLC zostaví: BaseURL + "S!d2Ea.../Fragments(video=Init)"
+    = https://render.com/cdn/PATH/S!d2Ea.../Fragments(video=Init)?h=HOST
+    """
+    parsed = urlparse(cdn_url)
+    path = parsed.path
     if '/Manifest' in path:
         base_path = path[:path.index('/Manifest') + 1]
     elif path.endswith('/'):
@@ -53,50 +61,66 @@ def rewrite_mpd(content, base_url):
     else:
         base_path = path.rsplit('/', 1)[0] + '/'
 
-    cdn_base = parsed.scheme + "://" + parsed.netloc + base_path
-    proxy_base = make_proxy_url(cdn_base)
+    return f"{server_url()}/cdn/{parsed.netloc}{base_path}?h={parsed.netloc}"
 
-    # Vlož <BaseURL> hneď za <Period> tag (alebo na začiatok ak nie je)
-    base_url_element = f'<BaseURL>{proxy_base}</BaseURL>'
 
-    # Vlož za prvý <Period> tag
+def rewrite_mpd(content, base_url):
+    """Vloží <BaseURL> do MPD – VLC sám zostaví správne URL s expandovanými premennými."""
+    base_url_element = f'<BaseURL>{make_base_url(base_url)}</BaseURL>'
     if '<Period' in content:
-        content = re.sub(
-            r'(<Period[^>]*>)',
-            r'\1' + base_url_element,
-            content,
-            count=1
-        )
-    elif '<MPD' in content:
-        # Fallback – vlož za MPD otvárajúci tag
-        content = re.sub(
-            r'(<MPD[^>]*>)',
-            r'\1' + base_url_element,
-            content,
-            count=1
-        )
-
-    return content
+        return re.sub(r'(<Period[^>]*>)', r'\1' + base_url_element, content, count=1)
+    return re.sub(r'(<MPD[^>]*>)', r'\1' + base_url_element, content, count=1)
 
 
 def rewrite_m3u8(content, base_url):
     """Prepíše URL v M3U8 playlistoch cez /proxy."""
     parsed = urlparse(base_url)
     base_dir = parsed.scheme + "://" + parsed.netloc + "/".join(parsed.path.split("/")[:-1]) + "/"
-
     lines = content.splitlines()
     new_lines = []
     for line in lines:
         stripped = line.strip()
         if stripped and not stripped.startswith('#'):
-            if stripped.startswith('http'):
-                new_lines.append(make_proxy_url(stripped))
-            else:
-                new_lines.append(make_proxy_url(urljoin(base_dir, stripped)))
+            abs_url = stripped if stripped.startswith('http') else urljoin(base_dir, stripped)
+            new_lines.append(f"{server_url()}/proxy?url={quote(abs_url, safe='')}")
         else:
             new_lines.append(line)
     return '\n'.join(new_lines)
 
+
+def proxy_stream(url):
+    try:
+        upstream = requests.get(url, headers=PROXY_HEADERS, stream=True, timeout=30)
+    except Exception as e:
+        return Response(f'Proxy error: {e}', status=502)
+
+    if upstream.status_code != 200:
+        return Response(f'Upstream {upstream.status_code}: {url}', status=upstream.status_code)
+
+    content_type = upstream.headers.get('Content-Type', 'application/octet-stream')
+    is_mpd  = '.mpd' in url.lower() or 'mpd' in content_type or 'Manifest' in url
+    is_m3u8 = '.m3u8' in url.lower() or 'm3u' in content_type
+
+    if is_mpd:
+        rewritten = rewrite_mpd(upstream.text, url)
+        return Response(rewritten, content_type='application/dash+xml; charset=utf-8',
+                        headers={'Access-Control-Allow-Origin': '*'})
+
+    if is_m3u8:
+        rewritten = rewrite_m3u8(upstream.text, url)
+        return Response(rewritten, content_type='application/x-mpegURL; charset=utf-8',
+                        headers={'Access-Control-Allow-Origin': '*'})
+
+    def generate():
+        for chunk in upstream.iter_content(chunk_size=65536):
+            if chunk:
+                yield chunk
+
+    return Response(stream_with_context(generate()), content_type=content_type,
+                    headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache'})
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
@@ -106,59 +130,54 @@ def index():
 @app.route('/channel/<channel_id>')
 def channel_proxy(channel_id):
     stream_info = magio.channel_stream_info(channel_id)
-    return proxy_url(stream_info.url)
+    return proxy_stream(stream_info.url)
 
 
 @app.route('/proxy')
 def proxy_route():
     url = request.args.get('url')
     if not url:
-        return 'Missing url parameter', 400
-    return proxy_url(url)
+        return 'Missing url', 400
+    return proxy_stream(url)
 
 
-def proxy_url(url):
-    try:
-        upstream = requests.get(url, headers=PROXY_HEADERS, stream=True, timeout=30)
-    except Exception as e:
-        return Response(f'Proxy error: {e}', status=502)
+@app.route('/cdn/<path:cdn_path>')
+def cdn_proxy(cdn_path):
+    """
+    Path-based proxy. VLC zostaví URL ako:
+    /cdn/s1-h4.cdn.magio.tv/.../index.mpd/S!d2Ea.../Fragments(video=Init)?h=s1-h4.cdn.magio.tv
+    """
+    cdn_host = request.args.get('h')
+    if not cdn_host:
+        # Skús extrahovať host z prvého segmentu cesty
+        parts = cdn_path.split('/', 1)
+        cdn_host = parts[0]
+        path_rest = parts[1] if len(parts) > 1 else ''
+        cdn_path = f"{cdn_host}/{path_rest}"
 
-    if upstream.status_code != 200:
-        return Response(f'Upstream error: {upstream.status_code} {url}', status=upstream.status_code)
+    # Zostaví absolútnu CDN URL
+    # cdn_path môže obsahovať host aj cestu: "s1-h4.cdn.magio.tv/___PARAM_.../Fragments(...)"
+    if cdn_path.startswith(cdn_host):
+        real_path = cdn_path[len(cdn_host):]
+    else:
+        real_path = '/' + cdn_path
 
-    content_type = upstream.headers.get('Content-Type', 'application/octet-stream')
-    is_mpd  = '.mpd' in url.lower() or 'mpd' in content_type
-    is_m3u8 = '.m3u8' in url.lower() or 'm3u' in content_type
+    url = f"https://{cdn_host}{real_path}"
 
-    if is_mpd:
-        content = upstream.text
-        rewritten = rewrite_mpd(content, url)
-        return Response(rewritten, content_type='application/dash+xml; charset=utf-8',
-                        headers={'Access-Control-Allow-Origin': '*'})
+    # Pridaj query string okrem h=
+    qs_parts = [(k, v) for k, v in request.args.items() if k != 'h']
+    if qs_parts:
+        url += '?' + '&'.join(f"{k}={v}" for k, v in qs_parts)
 
-    if is_m3u8:
-        content = upstream.text
-        rewritten = rewrite_m3u8(content, url)
-        return Response(rewritten, content_type='application/x-mpegURL; charset=utf-8',
-                        headers={'Access-Control-Allow-Origin': '*'})
-
-    # Binárne dáta (video/audio fragmenty) – stream priamo
-    def generate():
-        for chunk in upstream.iter_content(chunk_size=65536):
-            if chunk:
-                yield chunk
-
-    return Response(
-        stream_with_context(generate()),
-        content_type=content_type,
-        headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache'}
-    )
+    return proxy_stream(url)
 
 
 @app.errorhandler(404)
 def page_not_found(e):
     return redirect('/')
 
+
+# ── Generators ────────────────────────────────────────────────────────────────
 
 def gzip_file(file_path):
     with open(file_path, 'rb') as src, gzip.open(f'{file_path}.gz', 'wb') as dst:
@@ -178,7 +197,6 @@ def generate_xmltv(channels):
     date_from = datetime.datetime.now()
     date_to   = datetime.datetime.now() + datetime.timedelta(days=int(os.environ.get('MAGIO_GUIDE_DAYS', 7)))
     channel_ids = [c.id for c in channels]
-
     with tqdm(total=100, desc="Generating XMLTV", unit="pct", file=sys.stdout) as bar:
         last = {'v': 0}
         def prog(p):
@@ -188,7 +206,6 @@ def generate_xmltv(channels):
                 last['v'] = p
         epg = magio.epg(channel_ids, date_from, date_to, progress=prog)
         prog(100)
-
     with open("public/magioGuide.xmltv", "wb") as gf:
         writer = xmltv.Writer(
             date=datetime.datetime.now().strftime("%Y%m%d%H%M%S"),
@@ -231,7 +248,8 @@ def refresh():
     last_refresh = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
 
-# Startup
+# ── Startup ───────────────────────────────────────────────────────────────────
+
 qualityString = os.environ.get('MAGIO_QUALITY', "HIGH")
 quality = {"LOW": MagioQuality.low, "MEDIUM": MagioQuality.medium, "HIGH": MagioQuality.high, "EXTRA": MagioQuality.extra}[qualityString]
 device_type = os.environ.get('MAGIO_DEVICE_TYPE', "OTT_STB")
@@ -239,7 +257,7 @@ device_name = os.environ.get('MAGIO_DEVICE_NAME', "Magio IPTV Server")
 magio_username = os.environ.get('MAGIO_USERNAME', '1eabfvjdpp')
 magio_password = os.environ.get('MAGIO_PASSWORD', 'Miriamka510')
 
-print(f"Quality: {qualityString}, Device: {device_type}, Name: {device_name}")
+print(f"Quality: {qualityString}, Device: {device_type}")
 print("Logging in...")
 magio = MagioGo("./storage", magio_username, magio_password, quality, device_type, device_name)
 refresh()
